@@ -114,6 +114,7 @@ static id JSONMessageWithContentOf(NSData* expected) {
 - (bool)testFlagsChangedEventsArePropagatedIfNotHandled:(id)mockEngine;
 - (bool)testKeyboardIsRestartedOnEngineRestart:(id)mockEngine;
 - (bool)testTrackpadGesturesAreSentToFramework:(id)mockEngine;
+- (bool)testOrphanTrackpadGesturePhasesDoNotCrash:(id)engineMock;
 - (bool)mouseAndGestureEventsAreHandledSeparately:(id)engineMock;
 - (bool)testMouseDownUpEventsSentToNextResponder:(id)mockEngine;
 - (bool)testModifierKeysAreSynthesizedOnMouseMove:(id)mockEngine;
@@ -143,8 +144,10 @@ id MockGestureEvent(NSEventType type, NSEventPhase phase, double magnification, 
   CGFloat deltaY = 0;
   NSTimeInterval timestamp = 1;
   NSUInteger modifierFlags = 0;
+  NSEventPhase momentumPhase = NSEventPhaseNone;
   [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(type)] type];
   [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(phase)] phase];
+  [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(momentumPhase)] momentumPhase];
   [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(locationInWindow)] locationInWindow];
   [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(deltaX)] deltaX];
   [(NSEvent*)[[event stub] andReturnValue:OCMOCK_VALUE(deltaY)] deltaY];
@@ -310,6 +313,12 @@ TEST_F(FlutterViewControllerMockEngineTest, TestTrackpadGesturesAreSentToFramewo
   id mockEngine = GetMockEngine();
   ASSERT_TRUE(
       [[FlutterViewControllerTestObjC alloc] testTrackpadGesturesAreSentToFramework:mockEngine]);
+}
+
+TEST_F(FlutterViewControllerMockEngineTest, TestOrphanTrackpadGesturePhasesDoNotCrash) {
+  id mockEngine = GetMockEngine();
+  ASSERT_TRUE(
+      [[FlutterViewControllerTestObjC alloc] testOrphanTrackpadGesturePhasesDoNotCrash:mockEngine]);
 }
 
 TEST_F(FlutterViewControllerMockEngineTest, TestmouseAndGestureEventsAreHandledSeparately) {
@@ -1069,6 +1078,102 @@ TEST_F(FlutterViewControllerTest, testViewControllerIsReleased) {
   [viewController rotateWithEvent:flutter::testing::MockGestureEvent(NSEventTypeRotate,
                                                                      NSEventPhaseCancelled, 0, 0)];
   EXPECT_FALSE(called);
+
+  return true;
+}
+
+// Native popup menus (NSMenuTrackingSession) and embedded AppKit platform views (e.g. WKWebView)
+// can consume NSEventPhaseBegan/MayBegin before subsequent Changed/Ended/Stationary events land
+// on FlutterView. FlutterViewController must ignore unstarted gesture phases without throwing
+// NSInternalInconsistencyException or corrupting subsequent valid trackpad gestures.
+- (bool)testOrphanTrackpadGesturePhasesDoNotCrash:(id)engineMock {
+  FlutterRenderer* renderer_ = [[FlutterRenderer alloc] initWithFlutterEngine:engineMock];
+  OCMStub([engineMock renderer]).andReturn(renderer_);
+  __block bool called = false;
+  __block FlutterPointerEvent last_event;
+  OCMStub([[engineMock ignoringNonObjectArgs] sendPointerEvent:kDefaultFlutterPointerEvent])
+      .andDo((^(NSInvocation* invocation) {
+        FlutterPointerEvent* event;
+        [invocation getArgument:&event atIndex:2];
+        called = true;
+        last_event = *event;
+      }));
+
+  FlutterViewController* viewController = [[FlutterViewController alloc] initWithEngine:engineMock
+                                                                                nibName:@""
+                                                                                 bundle:nil];
+  [viewController loadView];
+
+  fml::CFRef<CGEventRef> cgBase(
+      CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 1, 0));
+  CGEventSetType(cgBase, kCGEventScrollWheel);
+  CGEventSetIntegerValueField(cgBase, kCGScrollWheelEventIsContinuous, 1);
+
+  // 1. Orphan scroll Changed without prior Began/MayBegin is ignored.
+  fml::CFRef<CGEventRef> cgOrphanChanged(CGEventCreateCopy(cgBase));
+  CGEventSetIntegerValueField(cgOrphanChanged, kCGScrollWheelEventScrollPhase,
+                              kCGScrollPhaseChanged);
+  CGEventSetIntegerValueField(cgOrphanChanged, kCGScrollWheelEventDeltaAxis2, 3);
+  CGEventSetIntegerValueField(cgOrphanChanged, kCGScrollWheelEventDeltaAxis1, 4);
+  called = false;
+  [viewController scrollWheel:[NSEvent eventWithCGEvent:cgOrphanChanged]];
+  EXPECT_FALSE(called);
+
+  // 2. Orphan scroll Ended without prior Began/MayBegin (exact NSMenuTrackingSession crash path)
+  //    must not throw NSInternalInconsistencyException or emit kPanZoomEnd.
+  fml::CFRef<CGEventRef> cgOrphanEnded(CGEventCreateCopy(cgBase));
+  CGEventSetIntegerValueField(cgOrphanEnded, kCGScrollWheelEventScrollPhase, kCGScrollPhaseEnded);
+  called = false;
+  [viewController scrollWheel:[NSEvent eventWithCGEvent:cgOrphanEnded]];
+  EXPECT_FALSE(called);
+
+  // 3. Stationary phase with momentumPhase == NSEventPhaseNone must not assert.
+  called = false;
+  [viewController magnifyWithEvent:flutter::testing::MockGestureEvent(
+                                       NSEventTypeMagnify, NSEventPhaseStationary, 0, 0)];
+  EXPECT_FALSE(called);
+
+  // 4. Orphan magnify/rotate Changed and Ended without prior Began are ignored.
+  called = false;
+  [viewController magnifyWithEvent:flutter::testing::MockGestureEvent(NSEventTypeMagnify,
+                                                                      NSEventPhaseChanged, 1, 0)];
+  EXPECT_FALSE(called);
+  [viewController magnifyWithEvent:flutter::testing::MockGestureEvent(NSEventTypeMagnify,
+                                                                      NSEventPhaseEnded, 0, 0)];
+  EXPECT_FALSE(called);
+  [viewController rotateWithEvent:flutter::testing::MockGestureEvent(
+                                      NSEventTypeRotate, NSEventPhaseChanged, 0, -90)];
+  EXPECT_FALSE(called);
+  [viewController rotateWithEvent:flutter::testing::MockGestureEvent(NSEventTypeRotate,
+                                                                     NSEventPhaseEnded, 0, 0)];
+  EXPECT_FALSE(called);
+
+  // 5. Subsequent valid Began -> Changed -> Ended trackpad scroll still works normally and does
+  //    not carry stale deltas from the ignored orphan Changed event above.
+  fml::CFRef<CGEventRef> cgStart(CGEventCreateCopy(cgBase));
+  CGEventSetIntegerValueField(cgStart, kCGScrollWheelEventScrollPhase, kCGScrollPhaseBegan);
+  called = false;
+  [viewController scrollWheel:[NSEvent eventWithCGEvent:cgStart]];
+  EXPECT_TRUE(called);
+  EXPECT_EQ(last_event.phase, kPanZoomStart);
+
+  fml::CFRef<CGEventRef> cgUpdate(CGEventCreateCopy(cgBase));
+  CGEventSetIntegerValueField(cgUpdate, kCGScrollWheelEventScrollPhase, kCGScrollPhaseChanged);
+  CGEventSetIntegerValueField(cgUpdate, kCGScrollWheelEventDeltaAxis2, 1);
+  CGEventSetIntegerValueField(cgUpdate, kCGScrollWheelEventDeltaAxis1, 2);
+  called = false;
+  [viewController scrollWheel:[NSEvent eventWithCGEvent:cgUpdate]];
+  EXPECT_TRUE(called);
+  EXPECT_EQ(last_event.phase, kPanZoomUpdate);
+  EXPECT_EQ(last_event.pan_x, 8 * viewController.flutterView.layer.contentsScale);
+  EXPECT_EQ(last_event.pan_y, 16 * viewController.flutterView.layer.contentsScale);
+
+  fml::CFRef<CGEventRef> cgEnd(CGEventCreateCopy(cgBase));
+  CGEventSetIntegerValueField(cgEnd, kCGScrollWheelEventScrollPhase, kCGScrollPhaseEnded);
+  called = false;
+  [viewController scrollWheel:[NSEvent eventWithCGEvent:cgEnd]];
+  EXPECT_TRUE(called);
+  EXPECT_EQ(last_event.phase, kPanZoomEnd);
 
   return true;
 }

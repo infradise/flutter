@@ -610,6 +610,9 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
     [self dispatchMouseEvent:event phase:kPanZoomUpdate];
   } else if (event.phase == NSEventPhaseEnded || event.phase == NSEventPhaseCancelled) {
     [self dispatchMouseEvent:event phase:kPanZoomEnd];
+  } else if (event.phase == NSEventPhaseStationary) {
+    // Fingers are resting motionless on the trackpad; nothing to dispatch.
+    return;
   } else if (event.phase == NSEventPhaseNone && event.momentumPhase == NSEventPhaseNone) {
     [self dispatchMouseEvent:event phase:kHover];
   } else {
@@ -620,8 +623,6 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
       _mouseState.last_scroll_momentum_changed_time = event.timestamp;
     }
     // Skip momentum update events, the framework will generate scroll momentum.
-    NSAssert(event.momentumPhase != NSEventPhaseNone,
-             @"Received gesture event with unexpected phase");
   }
 }
 
@@ -631,6 +632,18 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
   // events (e.g., drag out and back in, release, then click; mouseDown: will be called before
   // mouseEntered:). Discard those events, since the add will already have been synthesized.
   if (_mouseState.flutter_state_is_added && phase == kAdd) {
+    return;
+  }
+
+  // A native context menu (NSMenuTrackingSession) or embedded AppKit platform view
+  // (e.g., WKWebView) can consume NSEventPhaseBegan / NSEventPhaseMayBegin while subsequent
+  // Changed / Ended trackpad events hit FlutterView. Ignore unstarted update and end events
+  // cleanly so the embedder state machine stays consistent and never aborts via NSAssert.
+  if (phase == kPanZoomUpdate && !_mouseState.flutter_state_is_pan_zoom_started) {
+    return;
+  }
+  if (phase == kPanZoomEnd && !_mouseState.flutter_state_is_pan_zoom_started) {
+    _mouseState.GestureReset();
     return;
   }
 
@@ -657,14 +670,6 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
     _mouseState.flutter_state_is_pan_zoom_started = true;
   }
   if (phase == kPanZoomEnd) {
-    if (!_mouseState.flutter_state_is_pan_zoom_started) {
-      // NSEventPhaseCancelled is sometimes received at incorrect times in the state
-      // machine, just ignore it here if it doesn't make sense
-      // (we have no active gesture to cancel).
-      NSAssert(event.phase == NSEventPhaseCancelled,
-               @"Received gesture event with unexpected phase");
-      return;
-    }
     // NSEventPhase values are powers of two, we can use this to inspect merged phases.
     NSEventPhase all_gestures_fields = _mouseState.pan_gesture_phase |
                                        _mouseState.scale_gesture_phase |
